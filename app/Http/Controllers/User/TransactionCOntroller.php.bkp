@@ -1,0 +1,130 @@
+<?php
+
+namespace App\Http\Controllers\User;
+
+use App\Http\Controllers\Controller;
+use App\Services\StoredProcedure;
+use Illuminate\Http\Request;
+
+/**
+ * Sidebar item "Pay Out".
+ *
+ * CHANGED per USER_PANEL_ANALYSIS.md's biggest finding: this page used to
+ * be a straight port of user/TransactionList.aspx.cs, calling
+ * `USP_TRANSACTION_LIST_ForAdmin`. But that proc's columns
+ * (HolderName/BankName/AccountNo/IFSC/TAX/TAX_AMOUNT/TOTAL_AMOUNT/...)
+ * don't match what the live "Pay Out" screenshot actually shows (REF ID,
+ * USER ORDER ID, UTR, DR, Recharge, FEE, Balance, Status) - that column
+ * set is an exact match for `USP_USER_PAYOUT` instead (the user-scoped
+ * sibling of the admin Advance Search proc, `@trFlag=2` for Payout). Switched
+ * to match reality.
+ *
+ * IMPORTANT CAVEAT, unlike almost everything else in this codebase:
+ * `USP_USER_PAYOUT` has NO date-range parameters at all (@trFlag,
+ * @txtTrans, @txtUTR, @userID only) - it can't be told "give me Jan 1-31".
+ * But the live screenshot clearly has a working From/To date filter. There
+ * is no other proc in the SQL export with this column set AND date
+ * params. Rather than silently drop the date filter (which the screenshot
+ * shows working) or silently invent a proc that doesn't exist, this pulls
+ * every one of the user's payout rows (`@txtTrans='0'`, `@txtUTR='0'`,
+ * same "search everything" call the Advance Search page makes when both
+ * fields are blank) and filters by date range + status in PHP. This is a
+ * reconstruction, not a verified port - flagging it clearly rather than
+ * presenting it as equivalent to the rest of this migration. If the real
+ * app filters some other way (a proc not included in this SQL export,
+ * for instance), this will need revisiting once that's known.
+ *
+ * The 5 KPI tiles (Total Amount, Number of Payout Transactions, Total
+ * Success/Failed, Charge/Fee Amount) have no backing proc either - computed
+ * here from the same filtered row set, not fetched separately.
+ */
+class TransactionController extends Controller
+{
+    public function index(Request $request)
+    {
+        [$rows, $fromDate, $toDate, $status] = $this->fetchAndFilter($request);
+
+        return view('user.transactions.index', array_merge(
+            ['rows' => $rows, 'fromDate' => $fromDate, 'toDate' => $toDate, 'status' => $status],
+            $this->kpis($rows)
+        ));
+    }
+
+    /**
+     * Port of ExportGridToExcel() - same crude "render an HTML table with an
+     * .xls content-type" trick the original used, same filename pattern.
+     */
+    public function export(Request $request)
+    {
+        [$rows] = $this->fetchAndFilter($request);
+
+        $filename = 'Payout_Reports_'.now()->format('Y-m-d_His').'.xls';
+
+        $html = view('user.transactions.export', ['rows' => $rows])->render();
+
+        return response($html, 200, [
+            'Content-Type' => 'application/vnd.ms-excel',
+            'Content-Disposition' => 'attachment;filename='.$filename,
+            'Cache-Control' => 'no-cache',
+        ]);
+    }
+
+    /**
+     * @return array{0: array<int, object>, 1: string, 2: string, 3: string}
+     */
+    private function fetchAndFilter(Request $request): array
+    {
+        $userId = (int) $request->session()->get('user.id');
+
+        $fromDate = (string) $request->query('from_date', '');
+        $toDate = (string) $request->query('to_date', '');
+        $status = (string) $request->query('status', '0');
+
+        $rows = StoredProcedure::call('USP_TRANS_LIST_OUT', [
+            '@trFlag' => 2,
+            '@txtTrans' => '0',
+            '@txtUTR' => '0',
+            '@userID' => $userId,
+            '@CREATED_BY' => $userId,
+        ]);
+
+        if ($fromDate !== '') {
+            $rows = array_values(array_filter($rows, fn ($r) => substr((string) $r->CREATED_ON, 0, 10) >= $fromDate));
+        }
+        if ($toDate !== '') {
+            $rows = array_values(array_filter($rows, fn ($r) => substr((string) $r->CREATED_ON, 0, 10) <= $toDate));
+        }
+        if ($status !== '' && $status !== '0') {
+            $rows = array_values(array_filter($rows, fn ($r) => strcasecmp((string) $r->Status, $status) === 0));
+        }
+
+        return [$rows, $fromDate, $toDate, $status];
+    }
+
+    /** @return array<string, mixed> */
+    private function kpis(array $rows): array
+    {
+        $totalAmount = 0.0;
+        $success = 0;
+        $failed = 0;
+        $fee = 0.0;
+
+        foreach ($rows as $row) {
+            $totalAmount += (float) ($row->DR ?? 0) + (float) ($row->Recharge ?? 0);
+            $fee += (float) ($row->Fee ?? 0);
+            if (strcasecmp((string) $row->Status, 'SUCCESS') === 0) {
+                $success++;
+            } elseif (strcasecmp((string) $row->Status, 'FAILED') === 0) {
+                $failed++;
+            }
+        }
+
+        return [
+            'totalAmount' => $totalAmount,
+            'transactionCount' => count($rows),
+            'successCount' => $success,
+            'failedCount' => $failed,
+            'feeAmount' => $fee,
+        ];
+    }
+}
